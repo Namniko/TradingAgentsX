@@ -113,9 +113,9 @@ conda create -n tradingagents python=3.13
 conda activate tradingagents
 ```
 
-Install the package and its dependencies:
+Install the package in editable mode so the CLI uses your local source directly:
 ```bash
-pip install .
+pip install -e .
 ```
 
 ### Docker

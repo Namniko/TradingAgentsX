@@ -2,6 +2,7 @@ from typing import Annotated
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import os
 from .stockstats_utils import StockstatsUtils, _clean_dataframe, yf_retry, load_ohlcv, filter_financials_by_date
@@ -366,6 +367,297 @@ def get_saty_pivot_ribbon(
     )
 
 
+def _ttm_linreg(series: pd.Series, length: int) -> pd.Series:
+    """Linear regression value at last bar — equivalent to PineScript linreg(src, length, 0)."""
+    def _lr(y):
+        n = len(y)
+        xm = (n - 1) / 2.0
+        ym = y.mean()
+        denom = sum((j - xm) ** 2 for j in range(n))
+        if denom == 0:
+            return ym
+        slope = sum((j - xm) * (y[j] - ym) for j in range(n)) / denom
+        return slope * (n - 1) + (ym - slope * xm)
+    return series.rolling(length).apply(_lr, raw=True)
+
+
+def get_ttm_squeeze_pro(
+    symbol: str,
+    curr_date: str,
+    look_back_days: int = 30,
+) -> str:
+    """Compute TTM Squeeze Pro: volatility compression dots + momentum histogram."""
+    data = load_ohlcv(symbol, curr_date)
+    if data is None or data.empty:
+        return f"No OHLCV data available for {symbol} up to {curr_date}."
+
+    df = data.copy().sort_values("Date").reset_index(drop=True)
+    length = 20
+
+    # Bollinger Bands
+    sma20 = df["Close"].rolling(length).mean()
+    std20 = df["Close"].rolling(length).std(ddof=1)
+    bb_upper = sma20 + 2.0 * std20
+    bb_lower = sma20 - 2.0 * std20
+
+    # True Range and Keltner Channels (SMA of TR — matches PineScript ta.sma(ta.tr, length))
+    pc = df["Close"].shift(1)
+    tr = pd.concat(
+        [df["High"] - df["Low"], (df["High"] - pc).abs(), (df["Low"] - pc).abs()], axis=1
+    ).max(axis=1)
+    dev_kc = tr.rolling(length).mean()
+    kc_u1 = sma20 + dev_kc * 1.0;  kc_l1 = sma20 - dev_kc * 1.0
+    kc_u15 = sma20 + dev_kc * 1.5; kc_l15 = sma20 - dev_kc * 1.5
+    kc_u2 = sma20 + dev_kc * 2.0;  kc_l2 = sma20 - dev_kc * 2.0
+
+    # ATR14 for LATE signal distance
+    atr14 = tr.ewm(span=14, adjust=False).mean()
+
+    # Momentum: linreg(close - avg(avg(HH,LL), SMA20), 20, 0)
+    hh = df["High"].rolling(length).max()
+    ll = df["Low"].rolling(length).min()
+    delta = df["Close"] - ((hh + ll) / 2.0 + sma20) / 2.0
+    mom = _ttm_linreg(delta, length)
+
+    # --- Helper: classify dot ---
+    def _dot(i):
+        if pd.isna(bb_lower.iloc[i]) or pd.isna(kc_l1.iloc[i]):
+            return "NoSqz"
+        bbl, bbu = bb_lower.iloc[i], bb_upper.iloc[i]
+        if bbl >= kc_l1.iloc[i] or bbu <= kc_u1.iloc[i]:   return "HighSqz"
+        if bbl >= kc_l15.iloc[i] or bbu <= kc_u15.iloc[i]: return "MidSqz"
+        if bbl >= kc_l2.iloc[i] or bbu <= kc_u2.iloc[i]:   return "LowSqz"
+        return "NoSqz"
+
+    # --- Helper: momentum zone ---
+    def _zone(m, mp):
+        if pd.isna(m) or mp is None or pd.isna(mp): return "Neutral"
+        if m > 0 and mp <= 0: return "Crossing Up"
+        if m <= 0 and mp > 0: return "Crossing Down"
+        if m > 0 and m > mp:  return "Strong Bull"
+        if m > 0:             return "Fading Bull"
+        if m < mp:            return "Strong Bear"
+        if m < 0:             return "Fading Bear"
+        return "Neutral"
+
+    # --- Helper: signal strength ---
+    def _strength(comp_n, last_comp_dot, zone):
+        accel = zone in ("Strong Bull", "Strong Bear")
+        orange = last_comp_dot == "HighSqz"
+        if comp_n >= 20 and orange and accel: return "Maximum"
+        if comp_n >= 10 and orange and accel: return "Maximum"
+        if comp_n >= 5  and orange and accel: return "Very Strong"
+        if comp_n >= 10 and accel:            return "Strong"
+        if comp_n >= 5  and accel:            return "Moderate"
+        return "Weak"
+
+    # --- Helper: duration category ---
+    def _dur(n):
+        if n == 0:   return ""
+        if n <= 4:   return "Premature"
+        if n <= 9:   return "Standard"
+        if n <= 19:  return "Extended"
+        return "Extreme"
+
+    # --- Forward pass ---
+    n = len(df)
+    dots = [_dot(i) for i in range(n)]
+    compr_counts = [0] * n
+    transitions  = ["None"] * n
+    mom_zones    = [None] * n
+    signals      = ["NO-SIGNAL"] * n
+    strengths    = ["N/A"] * n
+    atr_notes    = [""] * n
+
+    active_compr = 0
+    active_start = None
+
+    for i in range(n):
+        dot      = dots[i]
+        prev_dot = dots[i - 1] if i > 0 else "NoSqz"
+        close_i  = df["Close"].iloc[i]
+        atr_i    = atr14.iloc[i]
+        m_i      = mom.iloc[i]
+        m_prev   = mom.iloc[i - 1] if i > 0 else None
+
+        # Compression tracking
+        fired_start = None
+        fired_count = 0
+        if dot != "NoSqz":
+            if prev_dot == "NoSqz":
+                active_compr = 1
+                active_start = close_i
+                transitions[i] = "Compression Building"
+            else:
+                active_compr += 1
+                transitions[i] = "Peak Compression" if dot == "HighSqz" else "Compression Building"
+        else:
+            if prev_dot != "NoSqz":
+                fired_start  = active_start
+                fired_count  = active_compr
+                transitions[i] = "Just Fired"
+                active_compr = 0
+                active_start = None
+
+        compr_counts[i] = active_compr
+
+        # Momentum zone
+        z = _zone(m_i, m_prev)
+        mom_zones[i] = z
+        pz  = mom_zones[i - 1] if i > 0 else None
+
+        atr_note = ""
+
+        # Signal — priority order
+        # 1. EXIT
+        if z == "Fading Bull":
+            if pz == "Fading Bull":
+                sig = "EXIT-LONG"
+            elif pz == "Strong Bull":
+                sig = "EXIT-WARNING-LONG"
+            else:
+                sig = "NO-SIGNAL"
+        elif z == "Fading Bear":
+            if pz == "Fading Bear":
+                sig = "EXIT-SHORT"
+            elif pz == "Strong Bear":
+                sig = "EXIT-WARNING-SHORT"
+            else:
+                sig = "NO-SIGNAL"
+        # 2. CONFIRMED / LATE (first green dot)
+        elif dot == "NoSqz" and prev_dot != "NoSqz":
+            if fired_count < 2:
+                sig = "NO-SIGNAL"
+            elif z in ("Strong Bull", "Fading Bull", "Crossing Up"):
+                dist = abs(close_i - fired_start) / atr_i if (atr_i > 0 and fired_start) else 0.0
+                if dist <= 1.0:
+                    sig = "CONFIRMED-BULL"
+                else:
+                    sig = "LATE-BULL"
+                    atr_note = (f"Price has moved {dist:.1f} ATR from squeeze start of "
+                                f"{fired_start:.2f}. Current price {close_i:.2f}. "
+                                f"Reward reduced, risk elevated.")
+            elif z in ("Strong Bear", "Fading Bear", "Crossing Down"):
+                dist = abs(close_i - fired_start) / atr_i if (atr_i > 0 and fired_start) else 0.0
+                if dist <= 1.0:
+                    sig = "CONFIRMED-BEAR"
+                else:
+                    sig = "LATE-BEAR"
+                    atr_note = (f"Price has moved {dist:.1f} ATR from squeeze start of "
+                                f"{fired_start:.2f}. Current price {close_i:.2f}. "
+                                f"Reward reduced, risk elevated.")
+            else:
+                sig = "NO-SIGNAL"
+        # 3. ANTICIPATORY / SETUP-WATCH (during compression)
+        elif dot != "NoSqz":
+            qualifies = active_compr >= 5 or dot == "HighSqz"
+            if qualifies and z == "Strong Bull":
+                sig = "ANTICIPATORY-BULL"
+            elif qualifies and z == "Strong Bear":
+                sig = "ANTICIPATORY-BEAR"
+            elif active_compr >= 1:
+                sig = "SETUP-WATCH"
+            else:
+                sig = "NO-SIGNAL"
+        else:
+            sig = "NO-SIGNAL"
+
+        signals[i]   = sig
+        atr_notes[i] = atr_note
+
+        # Strength (entry signals only)
+        if sig in ("ANTICIPATORY-BULL", "ANTICIPATORY-BEAR",
+                   "CONFIRMED-BULL", "CONFIRMED-BEAR", "LATE-BULL", "LATE-BEAR"):
+            comp_n = fired_count if (dot == "NoSqz" and prev_dot != "NoSqz") else active_compr
+            ref_dot = prev_dot if (dot == "NoSqz" and prev_dot != "NoSqz") else dot
+            strengths[i] = _strength(comp_n, ref_dot, z)
+
+    # Assign to df
+    df["date_str"]         = df["Date"].dt.strftime("%Y-%m-%d")
+    df["dot_color"]        = dots
+    df["compression_count"] = compr_counts
+    df["squeeze_transition"] = transitions
+    df["mom_zone"]         = mom_zones
+    df["signal"]           = signals
+    df["signal_strength"]  = strengths
+    df["atr_note"]         = atr_notes
+
+    # Locate latest row on or before curr_date
+    window = df[df["date_str"] <= curr_date]
+    if window.empty:
+        return f"No trading data found for {symbol} on or before {curr_date}."
+    lr = window.iloc[-1]
+
+    # History window
+    before_str = (
+        datetime.strptime(curr_date, "%Y-%m-%d") - relativedelta(days=look_back_days)
+    ).strftime("%Y-%m-%d")
+    hist = df[(df["date_str"] >= before_str) & (df["date_str"] <= curr_date)]
+
+    _dot_lbl = {"NoSqz": "No Squeeze (Fired)", "LowSqz": "Low Compression",
+                "MidSqz": "Mid Compression",  "HighSqz": "High Compression"}
+    _mom_dir = {"Strong Bull": "Above zero rising",   "Fading Bull": "Above zero falling",
+                "Strong Bear": "Below zero falling",  "Fading Bear": "Below zero rising",
+                "Crossing Up": "Crossing zero upward","Crossing Down": "Crossing zero downward",
+                "Neutral": "Near zero / neutral"}
+
+    def _summary(r):
+        dot = r["dot_color"]; comp = int(r["compression_count"])
+        z = r["mom_zone"]; sig = r["signal"]; sym = symbol.upper()
+        if dot == "NoSqz":
+            l1 = f"{sym} squeeze has fired — no active compression."
+        else:
+            l1 = f"{sym} is in {_dot_lbl[dot]} ({comp} bars, {_dur(comp)})."
+        l2 = f"Momentum is {z.lower()}."
+        l3 = f"Signal: {sig}." + (f" {r['atr_note']}" if r["atr_note"] else "")
+        return f"{l1} {l2} {l3}"
+
+    comp_lr = int(lr["compression_count"])
+    dur_str = f"{comp_lr} bars — {_dur(comp_lr)}" if comp_lr > 0 else "0 bars (no active compression)"
+
+    current = (
+        f"SYMBOL: {symbol.upper()}\n"
+        f"DATE: {lr['date_str']}\n\n"
+        f"SQUEEZE STATE: {_dot_lbl.get(lr['dot_color'], lr['dot_color'])}\n"
+        f"SQUEEZE DURATION: {dur_str}\n"
+        f"SQUEEZE TRANSITION: {lr['squeeze_transition']}\n\n"
+        f"MOMENTUM: {lr['mom_zone']}\n"
+        f"MOMENTUM DIRECTION: {_mom_dir.get(lr['mom_zone'], lr['mom_zone'])}\n\n"
+        f"SIGNAL: {lr['signal']}\n\n"
+        f"SIGNAL STRENGTH: {lr['signal_strength']}\n\n"
+        f"ATR NOTE: {lr['atr_note'] if lr['atr_note'] else 'N/A'}\n\n"
+        f"SUMMARY: {_summary(lr)}"
+    )
+
+    w = [10, 22, 15, 14, 20, 7]
+    hdr = (f"{'Date':<{w[0]}} {'Squeeze State':<{w[1]}} {'Duration':<{w[2]}} "
+           f"{'Momentum':<{w[3]}} {'Signal':<{w[4]}} {'Close':>{w[5]}}")
+    sep = "-" * (sum(w) + 5)
+    rows = []
+    for _, r in hist.sort_values("date_str", ascending=False).iterrows():
+        c = int(r["compression_count"])
+        dur_r = f"{c}b/{_dur(c)}" if c > 0 else "0"
+        rows.append(
+            f"{r['date_str']:<{w[0]}} {_dot_lbl.get(r['dot_color'], r['dot_color']):<{w[1]}} "
+            f"{dur_r:<{w[2]}} {r['mom_zone']:<{w[3]}} {r['signal']:<{w[4]}} {r['Close']:>{w[5]}.2f}"
+        )
+
+    return (
+        f"## TTM Squeeze Pro — {symbol.upper()}\n\n"
+        f"### Current State\n\n{current}\n\n---\n\n"
+        f"### {look_back_days}-Day History\n\n"
+        f"{hdr}\n{sep}\n" + "\n".join(rows) + "\n\n---\n\n"
+        f"### Signal Reference\n"
+        f"DOTS: NoSqz=Green(fired) | LowSqz=Black | MidSqz=Red | HighSqz=Orange\n"
+        f"DURATION: Premature=1-4 bars | Standard=5-9 | Extended=10-19 | Extreme=20+\n"
+        f"MOMENTUM: Strong Bull/Bear=accelerating | Fading=decelerating | Crossing=zero cross\n"
+        f"ANTICIPATORY: 5+ bars OR orange dot + directional non-crossing momentum\n"
+        f"CONFIRMED: first green dot + momentum aligned + within 1 ATR of squeeze start price\n"
+        f"LATE: first green dot + price beyond 1 ATR from squeeze start — report with ATR note\n"
+        f"EXIT-LONG: 2nd consecutive Fading Bull | EXIT-SHORT: 2nd consecutive Fading Bear\n"
+    )
+
+
 def get_stock_stats_indicators_window(
     symbol: Annotated[str, "ticker symbol of the company"],
     indicator: Annotated[str, "technical indicator to get the analysis and report of"],
@@ -446,6 +738,15 @@ def get_stock_stats_indicators_window(
             "Usage: Identify overbought (>80) or oversold (<20) conditions and confirm the strength of trends or reversals. "
             "Tips: Use alongside RSI or MACD to confirm signals; divergence between price and MFI can indicate potential reversals."
         ),
+        "ttm_squeeze_pro": (
+            "TTM Squeeze Pro: Volatility compression (squeeze dots) + momentum histogram. "
+            "Squeeze dots: NoSqz=Green(fired) | LowSqz=Black | MidSqz=Red | HighSqz=Orange. "
+            "Momentum: linear regression oscillator — positive/rising=bullish, negative/falling=bearish. "
+            "Signals: ANTICIPATORY (5+ bars or orange dot + directional momentum), "
+            "CONFIRMED/LATE (first green dot, within/beyond 1 ATR from squeeze start), "
+            "EXIT-LONG/SHORT (2nd consecutive decelerating momentum bar). "
+            "Use alongside saty_pivot_ribbon for trend context. Use look_back_days=30 or more."
+        ),
         "saty_pivot_ribbon": (
             "Saty Pivot Ribbon Pro: A multi-EMA ribbon system using EMAs 8/13/21/48/200. "
             "Produces structured state: Trend State (EMA stack ordering), Bias (price vs EMA21), "
@@ -461,9 +762,11 @@ def get_stock_stats_indicators_window(
             f"Indicator {indicator} is not supported. Please choose from: {list(best_ind_params.keys())}"
         )
 
-    # Saty Pivot Ribbon has its own computation path
+    # Custom computation paths (bypass stockstats)
     if indicator == "saty_pivot_ribbon":
         return get_saty_pivot_ribbon(symbol, curr_date, look_back_days)
+    if indicator == "ttm_squeeze_pro":
+        return get_ttm_squeeze_pro(symbol, curr_date, look_back_days)
 
     end_date = curr_date
     curr_date_dt = datetime.strptime(curr_date, "%Y-%m-%d")

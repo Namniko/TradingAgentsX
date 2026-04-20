@@ -27,6 +27,7 @@ from rich.rule import Rule
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
+from cli.local_config import load_local_config
 from cli.models import AnalystType
 from cli.utils import *
 from cli.announcements import fetch_announcements, display_announcements
@@ -464,6 +465,13 @@ def update_display(layout, spinner_text=None, stats_handler=None, start_time=Non
 
 def get_user_selections():
     """Get all user selections before starting the analysis display."""
+    try:
+        local_config, local_config_path = load_local_config(_PROJECT_ROOT)
+    except (OSError, ValueError) as exc:
+        console.print(f"[yellow]Warning: could not load local CLI config: {exc}[/yellow]")
+        local_config = {}
+        local_config_path = None
+
     # Display ASCII art welcome message
     with open(Path(__file__).parent / "static" / "welcome.txt", "r", encoding="utf-8") as f:
         welcome_ascii = f.read()
@@ -489,6 +497,12 @@ def get_user_selections():
     console.print()
     console.print()  # Add vertical space before announcements
 
+    if local_config_path and local_config:
+        console.print(
+            f"[dim]Loaded local CLI defaults from {local_config_path}[/dim]"
+        )
+        console.print()
+
     # Fetch and display announcements (silent on failure)
     announcements = fetch_announcements()
     display_announcements(console, announcements)
@@ -500,6 +514,13 @@ def get_user_selections():
         if default:
             box_content += f"\n[dim]Default: {default}[/dim]"
         return Panel(box_content, border_style="blue", padding=(1, 2))
+
+    def get_backend_url_for_provider(provider: str) -> str | None:
+        provider_lower = provider.lower()
+        for _, provider_key, url in PROVIDERS:
+            if provider_key == provider_lower:
+                return url
+        return None
 
     # Step 1: Ticker symbol
     console.print(
@@ -523,13 +544,20 @@ def get_user_selections():
     analysis_date = get_analysis_date()
 
     # Step 3: Output language
-    console.print(
-        create_question_box(
-            "Step 3: Output Language",
-            "Select the language for analyst reports and final decision"
+    if local_config.get("output_language"):
+        output_language = local_config["output_language"]
+        console.print(
+            f"[dim]Step 3: Output Language -> using local config value: {output_language}[/dim]"
         )
-    )
-    output_language = ask_output_language()
+    else:
+        console.print(
+            create_question_box(
+                "Step 3: Output Language",
+                "Select the language for analyst reports and final decision",
+                local_config.get("output_language"),
+            )
+        )
+        output_language = ask_output_language(local_config.get("output_language"))
 
     # Step 4: Select analysts
     console.print(
@@ -551,21 +579,53 @@ def get_user_selections():
     selected_research_depth = select_research_depth()
 
     # Step 6: LLM Provider
-    console.print(
-        create_question_box(
-            "Step 6: LLM Provider", "Select your LLM provider"
+    if local_config.get("llm_provider"):
+        selected_llm_provider = local_config["llm_provider"].lower()
+        backend_url = get_backend_url_for_provider(selected_llm_provider)
+        console.print(
+            f"[dim]Step 6: LLM Provider -> using local config value: {selected_llm_provider}[/dim]"
         )
-    )
-    selected_llm_provider, backend_url = select_llm_provider()
+    else:
+        console.print(
+            create_question_box(
+                "Step 6: LLM Provider",
+                "Select your LLM provider",
+                local_config.get("llm_provider"),
+            )
+        )
+        selected_llm_provider, backend_url = select_llm_provider(
+            default_provider=local_config.get("llm_provider")
+        )
 
     # Step 7: Thinking agents
-    console.print(
-        create_question_box(
-            "Step 7: Thinking Agents", "Select your thinking agents for analysis"
+    if local_config.get("quick_think_llm") and local_config.get("deep_think_llm"):
+        selected_shallow_thinker = local_config["quick_think_llm"]
+        selected_deep_thinker = local_config["deep_think_llm"]
+        console.print(
+            "[dim]Step 7: Thinking Agents -> using local config values: "
+            f"quick={selected_shallow_thinker}, deep={selected_deep_thinker}[/dim]"
         )
-    )
-    selected_shallow_thinker = select_shallow_thinking_agent(selected_llm_provider)
-    selected_deep_thinker = select_deep_thinking_agent(selected_llm_provider)
+    else:
+        console.print(
+            create_question_box(
+                "Step 7: Thinking Agents",
+                "Select your thinking agents for analysis",
+                (
+                    f"Quick: {local_config.get('quick_think_llm')} | "
+                    f"Deep: {local_config.get('deep_think_llm')}"
+                )
+                if local_config.get("quick_think_llm") or local_config.get("deep_think_llm")
+                else None,
+            )
+        )
+        selected_shallow_thinker = select_shallow_thinking_agent(
+            selected_llm_provider,
+            default_model=local_config.get("quick_think_llm"),
+        )
+        selected_deep_thinker = select_deep_thinking_agent(
+            selected_llm_provider,
+            default_model=local_config.get("deep_think_llm"),
+        )
 
     # Step 8: Provider-specific thinking configuration
     thinking_level = None
@@ -574,29 +634,56 @@ def get_user_selections():
 
     provider_lower = selected_llm_provider.lower()
     if provider_lower == "google":
-        console.print(
-            create_question_box(
-                "Step 8: Thinking Mode",
-                "Configure Gemini thinking mode"
+        if local_config.get("google_thinking_level") is not None:
+            thinking_level = local_config.get("google_thinking_level")
+            console.print(
+                f"[dim]Step 8: Thinking Mode -> using local config value: {thinking_level}[/dim]"
             )
-        )
-        thinking_level = ask_gemini_thinking_config()
+        else:
+            console.print(
+                create_question_box(
+                    "Step 8: Thinking Mode",
+                    "Configure Gemini thinking mode",
+                    local_config.get("google_thinking_level"),
+                )
+            )
+            thinking_level = ask_gemini_thinking_config(
+                local_config.get("google_thinking_level")
+            )
     elif provider_lower == "openai":
-        console.print(
-            create_question_box(
-                "Step 8: Reasoning Effort",
-                "Configure OpenAI reasoning effort level"
+        if local_config.get("openai_reasoning_effort") is not None:
+            reasoning_effort = local_config.get("openai_reasoning_effort")
+            console.print(
+                f"[dim]Step 8: Reasoning Effort -> using local config value: {reasoning_effort}[/dim]"
             )
-        )
-        reasoning_effort = ask_openai_reasoning_effort()
+        else:
+            console.print(
+                create_question_box(
+                    "Step 8: Reasoning Effort",
+                    "Configure OpenAI reasoning effort level",
+                    local_config.get("openai_reasoning_effort"),
+                )
+            )
+            reasoning_effort = ask_openai_reasoning_effort(
+                local_config.get("openai_reasoning_effort")
+            )
     elif provider_lower == "anthropic":
-        console.print(
-            create_question_box(
-                "Step 8: Effort Level",
-                "Configure Claude effort level"
+        if local_config.get("anthropic_effort") is not None:
+            anthropic_effort = local_config.get("anthropic_effort")
+            console.print(
+                f"[dim]Step 8: Effort Level -> using local config value: {anthropic_effort}[/dim]"
             )
-        )
-        anthropic_effort = ask_anthropic_effort()
+        else:
+            console.print(
+                create_question_box(
+                    "Step 8: Effort Level",
+                    "Configure Claude effort level",
+                    local_config.get("anthropic_effort"),
+                )
+            )
+            anthropic_effort = ask_anthropic_effort(
+                local_config.get("anthropic_effort")
+            )
 
     return {
         "ticker": selected_ticker,

@@ -1,0 +1,9 @@
+{
+  "output_language": "English",
+  "llm_provider": "openai",
+  "quick_think_llm": "gpt-5.4-mini",
+  "deep_think_llm": "gpt-5.4",
+  "openai_reasoning_effort": "medium",
+  "anthropic_effort": "medium",
+  "google_thinking_level": "high"
+}
